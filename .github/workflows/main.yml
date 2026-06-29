@@ -27,8 +27,11 @@ jobs:
           -framework Foundation \
           -framework QuartzCore \
           -framework UIKit \
+          -lz \
           -o libFPSTracer.dylib \
           FPSTracer.mm
+        
+        echo "Build thành công dylib cho iOS Device (arm64)"
         
         echo "Build thành công dylib cho iOS Device (arm64)"
 
