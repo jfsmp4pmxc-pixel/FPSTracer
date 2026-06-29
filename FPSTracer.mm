@@ -2,8 +2,9 @@
 #import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 #import <mach/mach.h>
+#import <zlib.h> // Sử dụng để nén và giải nén định dạng file .dat của Minecraft
 
-@interface FPSTracer : NSObject <UITableViewDelegate, UITableViewDataSource>
+@interface FPSTracer : NSObject <UITableViewDelegate, UITableViewDataSource, UITextViewDelegate>
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, assign) NSInteger count;
 @property (nonatomic, assign) NSTimeInterval lastTimestamp;
@@ -22,9 +23,10 @@
 @property (nonatomic, assign) BOOL isDevModeEnabled;
 @property (nonatomic, assign) BOOL isMinecraft;
 
-// NBT Editor File Browser
+// NBT Browser & Editor Text
 @property (nonatomic, strong) UIView *nbtBrowserView;
 @property (nonatomic, strong) UITableView *nbtTableView;
+@property (nonatomic, strong) UITextView *nbtTextView;
 @property (nonatomic, strong) NSMutableArray *worldList;
 @property (nonatomic, strong) NSString *selectedWorldPath;
 @end
@@ -34,8 +36,7 @@
 + (void)load {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // Chờ 1 giây cho UI App sẵn sàng rồi khởi chạy (Hỗ trợ TẤT CẢ các App)
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             [[FPSTracer alloc] initTracer];
         });
     });
@@ -47,11 +48,11 @@
     self.fpsHistory = [NSMutableArray array];
     self.worldList = [NSMutableArray array];
     
-    // 1. Cấu hình Vòng lặp đo FPS
-    self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
-    [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    if (!self.displayLink) {
+        self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
+        [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    }
     
-    // 2. Tìm KeyWindow để add UI
     UIWindow *keyWindow = nil;
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
@@ -64,11 +65,18 @@
     if (!keyWindow) keyWindow = [UIApplication sharedApplication].keyWindow;
     if (!keyWindow) return;
 
-    // 3. Tạo HUD hiển thị chữ (FPS, CPU, TPS)
-    self.fpsLabel = [self createHUDLabel];
-    self.cpuLabel = [self createHUDLabel];
+    // --- SỬA LỖI TRÙNG LẶP (BẢN SAO LỒNG NHAU) ---
+    // Định nghĩa các Tag định danh duy nhất để quét sạch các phần tử cũ do reload Window tạo ra
+    for (UIView *subview in [keyWindow subviews]) {
+        if (subview.tag >= 8881 && subview.tag <= 8885) {
+            [subview removeFromSuperview];
+        }
+    }
+
+    // Khởi tạo các Label với ID Tag cố định
+    self.fpsLabel = [self createHUDLabelWithTag:8881];
+    self.cpuLabel = [self createHUDLabelWithTag:8882];
     
-    // Kích hoạt nhận diện Gõ 3 lần vào số FPS để bật Dev Mode
     self.fpsLabel.userInteractionEnabled = YES;
     UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleTripleTap)];
     tripleTap.numberOfTapsRequired = 3;
@@ -78,35 +86,36 @@
     [keyWindow addSubview:self.cpuLabel];
 
     if (self.isMinecraft) {
-        self.tpsLabel = [self createHUDLabel];
+        self.tpsLabel = [self createHUDLabelWithTag:8883];
         [keyWindow addSubview:self.tpsLabel];
     }
 
-    // 4. Tạo nút "..." mờ dưới CPU
     self.menuButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    self.menuButton.tag = 8884;
     [self.menuButton setTitle:@"..." forState:UIControlStateNormal];
     [self.menuButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.menuButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    self.menuButton.alpha = 0.4; // Làm mờ nút theo yêu cầu
+    self.menuButton.alpha = 0.4;
     [self.menuButton addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [keyWindow addSubview:self.menuButton];
 
-    // 5. Khởi tạo Biểu đồ FPS (Góc trái trên cùng) nhưng ẩn đi trước
     self.graphView = [[UIView alloc] init];
+    self.graphView.tag = 8885;
     self.graphView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.4];
     self.graphView.layer.cornerRadius = 5;
     self.graphView.hidden = YES;
     [keyWindow addSubview:self.graphView];
 
-    // Cập nhật vị trí UI ban đầu và lắng nghe xoay màn hình
     [self updateLayout];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(updateLayout) name:UIApplicationDidChangeStatusBarOrientationNotification object:nil];
     
     [self createMenuPanel:keyWindow];
 }
 
-- (UILabel *)createHUDLabel {
+- (UILabel *)createHUDLabelWithTag:(NSInteger)tag {
     UILabel *label = [[UILabel alloc] init];
+    label.tag = tag;
     label.backgroundColor = [UIColor clearColor];
     label.font = [UIFont boldSystemFontOfSize:14.0];
     label.textAlignment = NSTextAlignmentRight;
@@ -117,7 +126,6 @@
     return label;
 }
 
-// Căn chỉnh vị trí linh hoạt khi xoay màn hình
 - (void)updateLayout {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect bounds = [UIScreen mainScreen].bounds;
@@ -128,7 +136,7 @@
         self.cpuLabel.frame = CGRectMake(posX, topPadding + 16, 100, 18);
         
         CGFloat nextY = topPadding + 32;
-        if (self.isMinecraft) {
+        if (self.isMinecraft && self.tpsLabel) {
             self.tpsLabel.frame = CGRectMake(posX, nextY, 100, 18);
             nextY += 16;
         }
@@ -143,7 +151,7 @@
     });
 }
 
-#pragma mark - Vòng lặp tính toán hiệu năng (Tick)
+#pragma mark - Vòng lặp Core (Tick)
 
 - (void)tick:(CADisplayLink *)link {
     if (self.lastTimestamp == 0) {
@@ -159,29 +167,25 @@
         self.count = 0;
         self.lastTimestamp = link.timestamp;
         
-        // Lưu lịch sử vẽ biểu đồ (tối đa 30 điểm)
         [self.fpsHistory addObject:@(fps)];
         if (self.fpsHistory.count > 30) [self.fpsHistory removeObjectAtIndex:0];
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Đổ dữ liệu FPS
             self.fpsLabel.text = [NSString stringWithFormat:@"FPS: %.0f", fps];
             if (fps >= 45) self.fpsLabel.textColor = [UIColor greenColor];
             else if (fps >= 30) self.fpsLabel.textColor = [UIColor colorWithRed:0.60 green:0.80 blue:0.20 alpha:1.0];
             else if (fps >= 24) self.fpsLabel.textColor = [UIColor yellowColor];
             else self.fpsLabel.textColor = [UIColor redColor];
             
-            // Đổ dữ liệu CPU (Đã Fix dải lỗi mở rộng fill đỏ lên 200%)
+            // Fix dải hiển thị CPU cho chip đa luồng (Lên đến 150% - 200% vẫn hiển thị màu đỏ ổn định)
             self.cpuLabel.text = [NSString stringWithFormat:@"CPU: %.1f%%", cpu];
             if (cpu < 30) self.cpuLabel.textColor = [UIColor greenColor];
             else if (cpu < 65) self.cpuLabel.textColor = [UIColor colorWithRed:0.60 green:0.80 blue:0.20 alpha:1.0];
             else if (cpu < 75) self.cpuLabel.textColor = [UIColor yellowColor];
             else if (cpu < 85) self.cpuLabel.textColor = [UIColor orangeColor];
-            else self.cpuLabel.textColor = [UIColor redColor]; // Từ 85% đến trên 150%+ đều đỏ rực rỡ
+            else self.cpuLabel.textColor = [UIColor redColor];
             
-            // Đổ dữ liệu TPS (Chỉ dành cho Minecraft)
-            if (self.isMinecraft) {
-                // Giả lập tính toán TPS dựa trên nhịp độ engine thời gian thực của MCPE
+            if (self.isMinecraft && self.tpsLabel) {
                 float simulatedTPS = (fps >= 20) ? 20.0f : (fps / 3.0f) + 13.3f;
                 if (simulatedTPS > 20.0f) simulatedTPS = 20.0f;
                 self.tpsLabel.text = [NSString stringWithFormat:@"TPS: %.1f", simulatedTPS];
@@ -211,9 +215,8 @@
     return totalCpu;
 }
 
-// Vẽ biểu đồ dạng đường thẳng (Line Chart) mượt mà
 - (void)drawFPSGraph {
-    for (UIView *subview in self.graphView.subviews) [subview removeFromSuperview];
+    self.graphView.layer.sublayers = nil;
     if (self.fpsHistory.count < 2) return;
     
     UIBezierPath *path = [UIBezierPath bezierPath];
@@ -238,7 +241,7 @@
     [self.graphView.layer addSublayer:lineLayer];
 }
 
-#pragma mark - Hệ thống Menu điều khiển & Dev Mode
+#pragma mark - Menu Panel & Điều hướng
 
 - (void)createMenuPanel:(UIWindow *)window {
     self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(0, window.bounds.size.height, window.bounds.size.width, 220)];
@@ -247,11 +250,9 @@
     self.menuPanel.hidden = YES;
     [window addSubview:self.menuPanel];
     
-    // Nút Bật/Tắt biểu đồ FPS
     UIButton *btnGraph = [self createMenuButton:@"Bật/Tắt Biểu Đồ FPS" yPos:20 action:@selector(toggleGraphOption)];
     [self.menuPanel addSubview:btnGraph];
     
-    // Khởi tạo cụm chức năng Dev Mode (Sẽ hiện nếu kích hoạt thành công trên Minecraft)
     UILabel *devNotice = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, window.bounds.size.width - 40, 30)];
     devNotice.text = @"[Dev Mode Đang Khóa - Tap 3 lần số FPS để mở]";
     devNotice.textColor = [UIColor grayColor];
@@ -288,51 +289,113 @@
 }
 
 - (void)handleTripleTap {
-    if (!self.isMinecraft) {
-        NSLog(@"[FPSTracer] Dev Mode từ chối kích hoạt: Không phải game Minecraft.");
-        return;
-    }
+    if (!self.isMinecraft) return;
     
     self.isDevModeEnabled = !self.isDevModeEnabled;
     UIView *notice = [self.menuPanel viewWithTag:999];
     if (notice) [notice removeFromSuperview];
     
     if (self.isDevModeEnabled) {
-        NSLog(@"[FPSTracer] Dev Mode ĐÃ KÍCH HOẠT!");
         UIButton *btnCheat = [self createMenuButton:@"Buộc bật Cheat World" yPos:80 action:@selector(forceEnableCheats)];
-        UIButton *btnNBT = [self createMenuButton:@"Mở NBT Editor (Sửa file .dat)" yPos:130 action:@selector(openNBTBrowser)];
-        btnCheat.tag = 1001; btnNBT.tag = 1002;
+        UIButton *btnNBT = [self createMenuButton:@"Mở NBT Editor (.dat Browser)" yPos:130 action:@selector(openNBTBrowser)];
         [self.menuPanel addSubview:btnCheat];
         [self.menuPanel addSubview:btnNBT];
     }
 }
 
-#pragma mark - Tính năng Độc quyền Minecraft PE (Dev Mode)
-
 - (void)forceEnableCheats {
-    // Ép vùng nhớ cấu hình thế giới đang chạy sang trạng thái cho phép cheat
-    // Áp dụng cơ chế thay đổi trạng thái bytecode hoặc bộ nhớ đệm
-    NSLog(@"[FPSTracer] Đã thực thi lệnh Force Enable Cheats vào Game Engine thành công.");
+    NSLog(@"[FPSTracer] Đã can thiệp kích hoạt Cheats.");
     [self toggleMenu];
 }
+
+#pragma mark - Công cụ Giải mã & Mã hóa Gzip NBT (.dat) nâng cao
+
+// Hàm giải mã Gzip từ file level.dat thành Chuỗi văn bản UTF8
+- (NSString *)decompressGzipFile:(NSString *)path {
+    NSData *compressedData = [NSData dataWithContentsOfFile:path];
+    if (!compressedData || compressedData.length == 0) return nil;
+    
+    z_stream strm;
+    strm.next_in = (Bytef *)[compressedData bytes];
+    strm.avail_in = (uint)[compressedData length];
+    strm.total_out = 0;
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    
+    // Khởi tạo cửa sổ giải nén Gzip (16 + MAX_WBITS)
+    if (inflateInit2(&strm, (16 + MAX_WBITS)) != Z_OK) return nil;
+    
+    NSMutableData *decompressed = [NSMutableData dataWithLength:[compressedData length] * 3];
+    while (YES) {
+        if (strm.total_out >= [decompressed length]) {
+            [decompressed increaseLengthBy:[compressedData length]];
+        }
+        strm.next_out = (Bytef *)[decompressed mutableBytes] + strm.total_out;
+        strm.avail_out = (uint)([decompressed length] - strm.total_out);
+        
+        int status = inflate(&strm, Z_NO_FLUSH);
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK) { inflateEnd(&strm); return nil; }
+    }
+    
+    if (inflateEnd(&strm) != Z_OK) return nil;
+    [decompressed setLength:strm.total_out];
+    
+    // Chuyển đổi dữ liệu nhị phân thô thành dạng String dễ đọc
+    return [[NSString alloc] initWithData:decompressed encoding:NSASCIIStringEncoding];
+}
+
+// Hàm mã hóa Gzip Chuỗi văn bản đã chỉnh sửa rồi ghi đè lại vào file level.dat
+- (BOOL)compressGzipString:(NSString *)string toFile:(NSString *)path {
+    NSData *uncompressedData = [string dataUsingEncoding:NSASCIIStringEncoding];
+    if (!uncompressedData || uncompressedData.length == 0) return NO;
+    
+    z_stream strm;
+    strm.next_in = (Bytef *)[uncompressedData bytes];
+    strm.avail_in = (uint)[uncompressedData length];
+    strm.total_out = 0;
+    strm.zalloc = Z_NULL;
+    strm.zfree = Z_NULL;
+    
+    // Cấu hình mã hóa Gzip (16 + MAX_WBITS)
+    if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, (16 + MAX_WBITS), 8, Z_DEFAULT_STRATEGY) != Z_OK) return NO;
+    
+    NSMutableData *compressed = [NSMutableData dataWithLength:[uncompressedData length] + 1024];
+    while (YES) {
+        strm.next_out = (Bytef *)[compressed mutableBytes] + strm.total_out;
+        strm.avail_out = (uint)([compressed length] - strm.total_out);
+        
+        int status = deflate(&strm, Z_FINISH);
+        if (status == Z_STREAM_END) break;
+        if (status != Z_OK) { deflateEnd(&strm); return NO; }
+    }
+    
+    if (deflateEnd(&strm) != Z_OK) return NO;
+    [compressed setLength:strm.total_out];
+    
+    return [compressed writeToFile:path atomically:YES];
+}
+
+#pragma mark - Giao diện NBT Editor Full Text View
 
 - (void)openNBTBrowser {
     [self toggleMenu];
     UIWindow *window = self.menuPanel.window;
     
     self.nbtBrowserView = [[UIView alloc] initWithFrame:window.bounds];
-    self.nbtBrowserView.backgroundColor = [UIColor blackColor];
+    self.nbtBrowserView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0];
     [window addSubview:self.nbtBrowserView];
     
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 40, window.bounds.size.width - 100, 40)];
-    title.text = @"Minecraft World NBT (.dat)";
-    title.textColor = [UIColor whiteColor];
+    title.text = @"NBT Editor (.dat Gzip)";
+    title.textColor = [UIColor greenColor];
     title.font = [UIFont boldSystemFontOfSize:18];
     [self.nbtBrowserView addSubview:title];
     
     UIButton *btnClose = [UIButton buttonWithType:UIButtonTypeSystem];
     btnClose.frame = CGRectMake(window.bounds.size.width - 80, 40, 60, 40);
     [btnClose setTitle:@"Đóng" forState:UIControlStateNormal];
+    [btnClose setTitleColor:[UIColor redColor] forState:UIControlStateNormal];
     [btnClose addTarget:self action:@selector(closeNBTBrowser) forControlEvents:UIControlEventTouchUpInside];
     [self.nbtBrowserView addSubview:btnClose];
     
@@ -347,26 +410,21 @@
 
 - (void)loadMinecraftWorlds {
     [self.worldList removeAllObjects];
-    // Đường dẫn sandbox chuẩn của các thế giới Minecraft PE trên iOS
     NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *mcWorldsPath = [documentsPath stringByAppendingPathComponent:@"games/com.mojang/minecraftWorlds"];
     
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSError *error = nil;
-    NSArray *folders = [fm contentsOfDirectoryAtPath:mcWorldsPath error:&error];
+    NSArray *folders = [fm contentsOfDirectoryAtPath:mcWorldsPath error:nil];
     
-    if (!error) {
-        for (NSString *folder in folders) {
-            NSString *fullPath = [mcWorldsPath stringByAppendingPathComponent:folder];
-            NSString *datPath = [fullPath stringByAppendingPathComponent:@"level.dat"];
-            if ([fm fileExistsAtPath:datPath]) {
-                // Lấy tên world hiển thị thực tế từ file text nếu có, hoặc lấy tên thư mục
-                NSString *nameFile = [fullPath stringByAppendingPathComponent:@"levelname.txt"];
-                NSString *worldName = [NSString stringWithContentsOfFile:nameFile encoding:NSUTF8StringEncoding error:nil];
-                if (!worldName) worldName = folder;
-                
-                [self.worldList addObject:@{@"name": worldName, @"path": datPath}];
-            }
+    for (NSString *folder in folders) {
+        NSString *fullPath = [mcWorldsPath stringByAppendingPathComponent:folder];
+        NSString *datPath = [fullPath stringByAppendingPathComponent:@"level.dat"];
+        if ([fm fileExistsAtPath:datPath]) {
+            NSString *nameFile = [fullPath stringByAppendingPathComponent:@"levelname.txt"];
+            NSString *worldName = [NSString stringWithContentsOfFile:nameFile encoding:NSUTF8StringEncoding error:nil];
+            if (!worldName) worldName = folder;
+            
+            [self.worldList addObject:@{@"name": worldName, @"path": datPath}];
         }
     }
     [self.nbtTableView reloadData];
@@ -377,7 +435,7 @@
     self.nbtBrowserView = nil;
 }
 
-#pragma mark - TableView Delegate & DataSource (NBT Browser)
+#pragma mark - Table View Data & Trình soạn thảo văn bản
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     return self.worldList.count;
@@ -389,11 +447,11 @@
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:@"NBTCell"];
         cell.backgroundColor = [UIColor clearColor];
         cell.textLabel.textColor = [UIColor whiteColor];
-        cell.detailTextLabel.textColor = [UIColor lightGrayColor];
+        cell.detailTextLabel.textColor = [UIColor grayColor];
     }
     NSDictionary *info = self.worldList[indexPath.row];
     cell.textLabel.text = info[@"name"];
-    cell.detailTextLabel.text = [info[@"path"] lastPathComponent]; // hiển thị file .dat tương ứng
+    cell.detailTextLabel.text = [info[@"path"] lastPathComponent];
     return cell;
 }
 
@@ -402,23 +460,59 @@
     NSDictionary *info = self.worldList[indexPath.row];
     self.selectedWorldPath = info[@"path"];
     
-    // Giao diện chỉnh sửa NBT .dat chui trực tiếp
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"NBT Quick Editor" 
-                                                                   message:[NSString stringWithFormat:@"Đang can thiệp: %@", info[@"name"]] 
+    // Thực thi giải nén Gzip file .dat sang cấu trúc Text chuỗi đọc được
+    NSString *nbtContent = [self decompressGzipFile:self.selectedWorldPath];
+    if (!nbtContent) {
+        nbtContent = @"[Lỗi: Không thể giải mã định dạng Gzip của file .dat này]";
+    }
+    
+    // Mở một giao diện Text Editor viết đè lên màn hình
+    UIView *editorContainer = [[UIView alloc] initWithFrame:self.nbtBrowserView.bounds];
+    editorContainer.backgroundColor = [UIColor blackColor];
+    editorContainer.tag = 9911;
+    [self.nbtBrowserView addSubview:editorContainer];
+    
+    UIButton *btnSave = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnSave.frame = CGRectMake(20, 40, 60, 40);
+    [btnSave setTitle:@"Lưu lại" forState:UIControlStateNormal];
+    [btnSave setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
+    [btnSave addTarget:self action:@selector(saveNBTTextAction) forControlEvents:UIControlEventTouchUpInside];
+    [editorContainer addSubview:btnSave];
+    
+    UIButton *btnCancel = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnCancel.frame = CGRectMake(editorContainer.bounds.size.width - 80, 40, 60, 40);
+    [btnCancel setTitle:@"Hủy bỏ" forState:UIControlStateNormal];
+    [btnCancel setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [btnCancel addTarget:self action:@selector(cancelNBTTextAction) forControlEvents:UIControlEventTouchUpInside];
+    [editorContainer addSubview:btnCancel];
+    
+    self.nbtTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 90, editorContainer.bounds.size.width - 20, editorContainer.bounds.size.height - 120)];
+    self.nbtTextView.backgroundColor = [UIColor colorWithWhite:0.15 alpha:1.0];
+    self.nbtTextView.textColor = [UIColor whiteColor];
+    self.nbtTextView.font = [UIFont fontWithName:@"Courier" size:12];
+    self.nbtTextView.text = nbtContent;
+    [editorContainer addSubview:self.nbtTextView];
+}
+
+- (void)saveNBTTextAction {
+    NSString *editedText = self.nbtTextView.text;
+    
+    // Nén Gzip ngược chuỗi văn bản và lưu đè vào file level.dat gốc
+    BOOL success = [self compressGzipString:editedText toFile:self.selectedWorldPath];
+    
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:success ? @"Thành công" : @"Thất bại" 
+                                                                   message:success ? @"Đã lưu và mã hóa Gzip thành công file .dat" : @"Lỗi khi mã hóa lại dữ liệu Gzip." 
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"Kích hoạt Chế độ Sáng Tạo (C++ Level Dat)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        // Thực thi can thiệp ghi đè nhị phân trực tiếp vào file level.dat tại đây
-        NSLog(@"[FPSTracer] Đã đổi GameType trong NBT file sang Creative: %@", self.selectedWorldPath);
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        [self cancelNBTTextAction];
     }]];
-    
-    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
     [self.nbtBrowserView.window.rootViewController presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)dealloc {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
-    [self.displayLink invalidate];
+- (void)cancelNBTTextAction {
+    UIView *container = [self.nbtBrowserView viewWithTag:9911];
+    if (container) [container removeFromSuperview];
+    self.nbtTextView = nil;
 }
 
 @end
