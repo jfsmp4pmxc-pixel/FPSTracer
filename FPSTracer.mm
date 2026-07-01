@@ -510,6 +510,7 @@ extern "C" {
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self.displayLink invalidate];
+    [super dealloc];
 }
 
 @end
