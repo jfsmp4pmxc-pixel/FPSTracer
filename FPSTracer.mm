@@ -5,7 +5,13 @@
 #import <ifaddrs.h>
 #import <net/if.h>
 
-extern size_t os_proc_available_memory(void) __attribute__((weak_import));
+#ifdef __cplusplus
+extern "C" {
+#endif
+    size_t os_proc_available_memory(void) __attribute__((weak_import));
+#ifdef __cplusplus
+}
+#endif
 
 @interface FPSTracer : NSObject <UITableViewDelegate, UITableViewDataSource, UITextViewDelegate>
 @property (nonatomic, strong) CADisplayLink *displayLink;
