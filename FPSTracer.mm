@@ -5,6 +5,7 @@
 #import <ifaddrs.h>
 #import <net/if.h>
 
+// Ép cấu trúc C++ hiểu đúng hàm C của hệ thống để không bị lỗi Linker
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -18,7 +19,7 @@ extern "C" {
 @property (nonatomic, assign) NSInteger count;
 @property (nonatomic, assign) NSTimeInterval lastTimestamp;
 
-// HUD Views
+// HUD Labels
 @property (nonatomic, strong) UILabel *fpsLabel;
 @property (nonatomic, strong) UILabel *cpuLabel;
 @property (nonatomic, strong) UILabel *ramLabel;
@@ -28,21 +29,23 @@ extern "C" {
 @property (nonatomic, strong) UIView *graphView;
 @property (nonatomic, strong) NSMutableArray *fpsHistory;
 
-// UI Menu & Dev Mode
-@property (nonatomic, strong) UIView *menuPanel;
-@property (nonatomic, assign) BOOL isGraphVisible;
+// Trạng thái Bật/Tắt hiển thị thông số
+@property (nonatomic, assign) BOOL showFPS, showCPU, showRAM, showNet, showTPS, isGraphVisible;
 @property (nonatomic, assign) BOOL isDevModeEnabled;
 @property (nonatomic, assign) BOOL isMinecraft;
 
 @property (nonatomic, assign) uint32_t lastInputBytes;
 @property (nonatomic, assign) uint32_t lastOutputBytes;
 
-// Bedrock NBT (Hex) Editor Views
+// UI Panels
+@property (nonatomic, strong) UIView *menuPanel;
+@property (nonatomic, strong) UIScrollView *settingsScrollView;
 @property (nonatomic, strong) UIView *nbtBrowserView;
 @property (nonatomic, strong) UITableView *nbtTableView;
 @property (nonatomic, strong) UITextView *nbtTextView; 
 @property (nonatomic, strong) NSMutableArray *worldList;
 @property (nonatomic, strong) NSString *selectedWorldPath;
+@property (nonatomic, strong) NSData *originalNBTData; // Giữ bản nhị phân gốc để mapping dữ liệu thông minh
 @end
 
 @implementation FPSTracer
@@ -62,6 +65,9 @@ extern "C" {
     self.fpsHistory = [NSMutableArray array];
     self.worldList = [NSMutableArray array];
     
+    // Khởi tạo trạng thái mặc định: Bật hết
+    self.showFPS = YES; self.showCPU = YES; self.showRAM = YES; self.showNet = YES; self.showTPS = YES;
+    
     if (!self.displayLink) {
         self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(tick:)];
         [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -71,21 +77,21 @@ extern "C" {
     if (@available(iOS 13.0, *)) {
         for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if (scene.activationState == UISceneActivationStateForegroundActive) {
-                keyWindow = scene.windows.firstObject;
-                break;
+                keyWindow = scene.windows.firstObject; break;
             }
         }
     }
     if (!keyWindow) keyWindow = [UIApplication sharedApplication].keyWindow;
     if (!keyWindow) return;
 
-    // Quét sạch các bản sao cũ lồng nhau (Fix lỗi trùng lặp)
+    // Dọn sạch bản sao lồng nhau cũ
     for (UIView *subview in [keyWindow subviews]) {
         if (subview.tag >= 8881 && subview.tag <= 8887) {
             [subview removeFromSuperview];
         }
     }
 
+    // Thiết lập nhãn với mã màu trắng/sáng rõ ràng, không bị đen
     self.fpsLabel = [self createHUDLabelWithTag:8881];
     self.cpuLabel = [self createHUDLabelWithTag:8882];
     self.ramLabel = [self createHUDLabelWithTag:8886];
@@ -111,7 +117,7 @@ extern "C" {
     [self.menuButton setTitle:@"..." forState:UIControlStateNormal];
     [self.menuButton setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.menuButton.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    self.menuButton.alpha = 0.4;
+    self.menuButton.alpha = 0.5;
     [self.menuButton addTarget:self action:@selector(toggleMenu) forControlEvents:UIControlEventTouchUpInside];
     [keyWindow addSubview:self.menuButton];
 
@@ -133,12 +139,13 @@ extern "C" {
     UILabel *label = [[UILabel alloc] init];
     label.tag = tag;
     label.backgroundColor = [UIColor clearColor];
-    label.font = [UIFont boldSystemFontOfSize:13.0];
+    label.font = [UIFont fontWithName:@"Courier-Bold" size:13.0];
+    label.textColor = [UIColor whiteColor]; // Sửa lỗi màu đen khuất nền
     label.textAlignment = NSTextAlignmentRight;
     label.layer.shadowColor = [UIColor blackColor].CGColor;
-    label.layer.shadowOffset = CGSizeMake(0, 0);
-    label.layer.shadowRadius = 1.2;
-    label.layer.shadowOpacity = 1.0;
+    label.layer.shadowOffset = CGSizeMake(1, 1);
+    label.layer.shadowRadius = 1.0;
+    label.layer.shadowOpacity = 0.9;
     return label;
 }
 
@@ -146,82 +153,73 @@ extern "C" {
     dispatch_async(dispatch_get_main_queue(), ^{
         CGRect bounds = [UIScreen mainScreen].bounds;
         CGFloat topPadding = (bounds.size.width > bounds.size.height) ? 10 : 25;
-        CGFloat posX = bounds.size.width - 150;
-        CGFloat width = 130;
+        CGFloat posX = bounds.size.width - 165;
+        CGFloat width = 150;
         
-        self.fpsLabel.frame = CGRectMake(posX, topPadding, width, 16);
-        self.cpuLabel.frame = CGRectMake(posX, topPadding + 14, width, 16);
-        self.ramLabel.frame = CGRectMake(posX, topPadding + 28, width, 16);
-        self.netLabel.frame = CGRectMake(posX, topPadding + 42, width, 16);
+        // Quản lý hiển thị linh hoạt dựa trên Cài đặt gạt Switch
+        CGFloat currentY = topPadding;
         
-        CGFloat nextY = topPadding + 56;
+        self.fpsLabel.frame = CGRectMake(posX, currentY, width, 16);
+        self.fpsLabel.hidden = !self.showFPS;
+        if (self.showFPS) currentY += 15;
+        
+        self.cpuLabel.frame = CGRectMake(posX, currentY, width, 16);
+        self.cpuLabel.hidden = !self.showCPU;
+        if (self.showCPU) currentY += 15;
+        
+        self.ramLabel.frame = CGRectMake(posX, currentY, width, 16);
+        self.ramLabel.hidden = !self.showRAM;
+        if (self.showRAM) currentY += 15;
+        
+        self.netLabel.frame = CGRectMake(posX, currentY, width, 16);
+        self.netLabel.hidden = !self.showNet;
+        if (self.showNet) currentY += 15;
+        
         if (self.isMinecraft && self.tpsLabel) {
-            self.tpsLabel.frame = CGRectMake(posX, nextY, width, 16);
-            nextY += 14;
+            self.tpsLabel.frame = CGRectMake(posX, currentY, width, 16);
+            self.tpsLabel.hidden = !self.showTPS;
+            if (self.showTPS) currentY += 15;
         }
         
-        self.menuButton.frame = CGRectMake(bounds.size.width - 45, nextY, 30, 15);
+        self.menuButton.frame = CGRectMake(bounds.size.width - 45, currentY + 5, 30, 18);
         self.graphView.frame = CGRectMake(15, topPadding, 150, 60);
-        
-        [self.fpsLabel.superview bringSubviewToFront:self.fpsLabel];
-        [self.cpuLabel.superview bringSubviewToFront:self.cpuLabel];
-        [self.ramLabel.superview bringSubviewToFront:self.ramLabel];
-        [self.netLabel.superview bringSubviewToFront:self.netLabel];
-        if (self.tpsLabel) [self.tpsLabel.superview bringSubviewToFront:self.tpsLabel];
-        [self.menuButton.superview bringSubviewToFront:self.menuButton];
     });
 }
 
-#pragma mark - Vòng lặp Core (Tick) & Hệ thống đo đạc
+#pragma mark - Vòng lặp Hệ thống & Đo Đạc
 
 - (void)tick:(CADisplayLink *)link {
-    if (self.lastTimestamp == 0) {
-        self.lastTimestamp = link.timestamp;
-        return;
-    }
+    if (self.lastTimestamp == 0) { self.lastTimestamp = link.timestamp; return; }
     self.count++;
     NSTimeInterval delta = link.timestamp - self.lastTimestamp;
     
     if (delta >= 1.0) {
         double fps = self.count / delta;
         float cpu = [self getCPUUsage];
+        double ramCurrent = 0, ramMax = 0; [self getRAMUsageCurrent:&ramCurrent maxAllocated:&ramMax];
+        double netDL = 0, netUL = 0; [self getNetworkSpeedDownload:&netDL upload:&netUL delta:delta];
         
-        double ramCurrent = 0, ramMax = 0;
-        [self getRAMUsageCurrent:&ramCurrent maxAllocated:&ramMax];
-        
-        double netDL = 0, netUL = 0;
-        [self getNetworkSpeedDownload:&netDL upload:&netUL delta:delta];
-        
-        self.count = 0;
-        self.lastTimestamp = link.timestamp;
-        
+        self.count = 0; self.lastTimestamp = link.timestamp;
         [self.fpsHistory addObject:@(fps)];
         if (self.fpsHistory.count > 30) [self.fpsHistory removeObjectAtIndex:0];
         
         dispatch_async(dispatch_get_main_queue(), ^{
-            self.fpsLabel.text = [NSString stringWithFormat:@"FPS: %.0f", fps];
-            if (fps >= 45) self.fpsLabel.textColor = [UIColor greenColor];
-            else if (fps >= 30) self.fpsLabel.textColor = [UIColor colorWithRed:0.60 green:0.80 blue:0.20 alpha:1.0];
-            else self.fpsLabel.textColor = [UIColor redColor];
-            
-            self.cpuLabel.text = [NSString stringWithFormat:@"CPU: %.1f%%", cpu];
-            
-            if (ramMax > 0) {
-                self.ramLabel.text = [NSString stringWithFormat:@"RAM: %.0f/%.0f MB", ramCurrent, ramMax];
-            } else {
-                self.ramLabel.text = [NSString stringWithFormat:@"RAM: %.0f MB", ramCurrent];
+            if (self.showFPS) {
+                self.fpsLabel.text = [NSString stringWithFormat:@"FPS: %.0f", fps];
+                if (fps >= 45) self.fpsLabel.textColor = [UIColor greenColor];
+                else if (fps >= 28) self.fpsLabel.textColor = [UIColor orangeColor];
+                else self.fpsLabel.textColor = [UIColor redColor];
             }
-            double ramRatio = (ramMax > 0) ? (ramCurrent / ramMax) : 0;
-            self.ramLabel.textColor = (ramRatio > 0.85) ? [UIColor redColor] : [UIColor whiteColor];
-            
-            self.netLabel.text = [NSString stringWithFormat:@"D:%.1fM U:%.1fM/s", netDL, netUL];
-            
-            if (self.isMinecraft && self.tpsLabel) {
+            if (self.showCPU) self.cpuLabel.text = [NSString stringWithFormat:@"CPU: %.1f%%", cpu];
+            if (self.showRAM) {
+                self.ramLabel.text = (ramMax > 0) ? [NSString stringWithFormat:@"RAM: %.0f/%.0f MB", ramCurrent, ramMax] : [NSString stringWithFormat:@"RAM: %.0f MB", ramCurrent];
+            }
+            if (self.showNet) self.netLabel.text = [NSString stringWithFormat:@"D:%.1fM U:%.1fM/s", netDL, netUL];
+            if (self.isMinecraft && self.tpsLabel && self.showTPS) {
                 float simulatedTPS = (fps >= 20) ? 20.0f : (fps / 3.0f) + 13.3f;
-                if (simulatedTPS > 20.0f) simulatedTPS = 20.0f;
-                self.tpsLabel.text = [NSString stringWithFormat:@"TPS: %.1f", simulatedTPS];
+                self.tpsLabel.text = [NSString stringWithFormat:@"TPS: %.1f", (simulatedTPS > 20.0f) ? 20.0f : simulatedTPS];
             }
-            if (self.isGraphVisible) [self drawFPSGraph];
+            if (self.isGraphVisible && self.showFPS) [self drawFPSGraph];
         });
     }
 }
@@ -245,16 +243,11 @@ extern "C" {
 }
 
 - (void)getRAMUsageCurrent:(double *)current maxAllocated:(double *)max {
-    task_vm_info_data_t vmInfo;
-    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    task_vm_info_data_t vmInfo; mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vmInfo, &count) == KERN_SUCCESS) {
         *current = (double)vmInfo.phys_footprint / (1024.0 * 1024.0);
     }
-    if (os_proc_available_memory != NULL) {
-        *max = *current + ((double)os_proc_available_memory() / (1024.0 * 1024.0));
-    } else {
-        *max = 0.0;
-    }
+    if (os_proc_available_memory != NULL) *max = *current + ((double)os_proc_available_memory() / (1024.0 * 1024.0));
 }
 
 - (void)getNetworkSpeedDownload:(double *)download upload:(double *)upload delta:(NSTimeInterval)delta {
@@ -267,8 +260,7 @@ extern "C" {
                 if (if_data) {
                     NSString *name = [NSString stringWithUTF8String:ifa->ifa_name];
                     if ([name hasPrefix:@"en"] || [name hasPrefix:@"pdp_ip"]) {
-                        currentInputBytes += if_data->ifi_ibytes;
-                        currentOutputBytes += if_data->ifi_obytes;
+                        currentInputBytes += if_data->ifi_ibytes; currentOutputBytes += if_data->ifi_obytes;
                     }
                 }
             }
@@ -283,143 +275,173 @@ extern "C" {
 }
 
 - (void)drawFPSGraph {
-    self.graphView.layer.sublayers = nil;
-    if (self.fpsHistory.count < 2) return;
+    self.graphView.layer.sublayers = nil; if (self.fpsHistory.count < 2) return;
     UIBezierPath *path = [UIBezierPath bezierPath];
-    CGFloat stepX = self.graphView.bounds.size.width / 30.0;
-    CGFloat height = self.graphView.bounds.size.height;
+    CGFloat stepX = self.graphView.bounds.size.width / 30.0; CGFloat height = self.graphView.bounds.size.height;
     for (int i = 0; i < self.fpsHistory.count; i++) {
-        float val = [self.fpsHistory[i] floatValue];
-        if (val > 60) val = 60;
-        CGFloat pointY = height - (val / 60.0f * height);
-        CGFloat pointX = i * stepX;
-        if (i == 0) [path moveToPoint:CGPointMake(pointX, pointY)];
-        else [path addLineToPoint:CGPointMake(pointX, pointY)];
+        float val = [self.fpsHistory[i] floatValue]; if (val > 60) val = 60;
+        CGFloat pointY = height - (val / 60.0f * height); CGFloat pointX = i * stepX;
+        if (i == 0) [path moveToPoint:CGPointMake(pointX, pointY)]; else [path addLineToPoint:CGPointMake(pointX, pointY)];
     }
-    CAShapeLayer *lineLayer = [CAShapeLayer layer];
-    lineLayer.path = path.CGPath; lineLayer.strokeColor = [UIColor greenColor].CGColor;
-    lineLayer.fillColor = [UIColor clearColor].CGColor; lineLayer.lineWidth = 1.5;
+    CAShapeLayer *lineLayer = [CAShapeLayer layer]; lineLayer.path = path.CGPath;
+    lineLayer.strokeColor = [UIColor greenColor].CGColor; lineLayer.fillColor = [UIColor clearColor].CGColor; lineLayer.lineWidth = 1.5;
     [self.graphView.layer addSublayer:lineLayer];
 }
 
-#pragma mark - Menu Panel & Điều hướng
+#pragma mark - Menu Cài Đặt (Công tắc Switch Bật/Tắt)
 
 - (void)createMenuPanel:(UIWindow *)window {
-    self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(0, window.bounds.size.height, window.bounds.size.width, 220)];
-    self.menuPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.9];
-    self.menuPanel.layer.cornerRadius = 12;
-    self.menuPanel.hidden = YES;
+    self.menuPanel = [[UIView alloc] initWithFrame:CGRectMake(0, window.bounds.size.height, window.bounds.size.width, 260)];
+    self.menuPanel.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.92];
+    self.menuPanel.layer.cornerRadius = 14; self.menuPanel.hidden = YES;
     [window addSubview:self.menuPanel];
     
-    UIButton *btnGraph = [self createMenuButton:@"Bật/Tắt Biểu Đồ FPS" yPos:20 action:@selector(toggleGraphOption)];
-    [self.menuPanel addSubview:btnGraph];
+    UILabel *menuTitle = [[UILabel alloc] initWithFrame:CGRectMake(20, 10, 200, 25)];
+    menuTitle.text = @"HUD & DEV CONTROLLER"; menuTitle.textColor = [UIColor whiteColor];
+    menuTitle.font = [UIFont boldSystemFontOfSize:14]; [self.menuPanel addSubview:menuTitle];
     
-    UILabel *devNotice = [[UILabel alloc] initWithFrame:CGRectMake(20, 80, window.bounds.size.width - 40, 30)];
-    devNotice.text = @"[Dev Mode Đang Khóa - Tap 3 lần số FPS để mở]";
-    devNotice.textColor = [UIColor grayColor]; devNotice.font = [UIFont systemFontOfSize:12];
-    devNotice.tag = 999;
-    [self.menuPanel addSubview:devNotice];
+    self.settingsScrollView = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 40, window.bounds.size.width, 210)];
+    [self.menuPanel addSubview:self.settingsScrollView];
+    
+    // Tạo danh sách nút gạt tùy chỉnh
+    [self createSettingRowWithTitle:@"Hiển thị chỉ số FPS" index:0 state:self.showFPS selector:@selector(fpsSwitchChanged:)];
+    [self createSettingRowWithTitle:@"Hiển thị chỉ số CPU" index:1 state:self.showCPU selector:@selector(cpuSwitchChanged:)];
+    [self createSettingRowWithTitle:@"Hiển thị chỉ số RAM" index:2 state:self.showRAM selector:@selector(ramSwitchChanged:)];
+    [self createSettingRowWithTitle:@"Hiển thị Băng Thông Net" index:3 state:self.showNet selector:@selector(netSwitchChanged:)];
+    if (self.isMinecraft) {
+        [self createSettingRowWithTitle:@"Hiển thị chỉ số TPS" index:4 state:self.showTPS selector:@selector(tpsSwitchChanged:)];
+    }
+    [self createSettingRowWithTitle:@"Biểu đồ sóng FPS Graph" index:5 state:self.isGraphVisible selector:@selector(graphSwitchChanged:)];
+    
+    self.settingsScrollView.contentSize = CGSizeMake(window.bounds.size.width, 6 * 40 + 50);
 }
 
-- (UIButton *)createMenuButton:(NSString *)title yPos:(CGFloat)y action:(SEL)selector {
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(20, y, [UIScreen mainScreen].bounds.size.width - 40, 40);
-    [btn setTitle:title forState:UIControlStateNormal]; [btn setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
-    btn.backgroundColor = [[UIColor whiteColor] colorWithAlphaComponent:0.1]; btn.layer.cornerRadius = 6;
-    [btn addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
-    return btn;
+- (void)createSettingRowWithTitle:(NSString *)title index:(int)i state:(BOOL)isOn selector:(SEL)action {
+    CGFloat yPos = i * 40;
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(20, yPos + 8, 200, 24)];
+    lbl.text = title; lbl.textColor = [UIColor lightGrayColor]; lbl.font = [UIFont systemFontOfSize:13];
+    [self.settingsScrollView addSubview:lbl];
+    
+    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake([UIScreen mainScreen].bounds.size.width - 70, yPos + 5, 50, 30)];
+    sw.on = isOn; sw.onTintColor = [UIColor greenColor];
+    [sw addTarget:self action:action forControlEvents:UIControlEventValueChanged];
+    [self.settingsScrollView addSubview:sw];
 }
+
+// Trình điều khiển sự kiện thay đổi công tắc gạt
+- (void)fpsSwitchChanged:(UISwitch *)sender { self.showFPS = sender.isOn; [self updateLayout]; }
+- (void)cpuSwitchChanged:(UISwitch *)sender { self.showCPU = sender.isOn; [self updateLayout]; }
+- (void)ramSwitchChanged:(UISwitch *)sender { self.showRAM = sender.isOn; [self updateLayout]; }
+- (void)netSwitchChanged:(UISwitch *)sender { self.showNet = sender.isOn; [self updateLayout]; }
+- (void)tpsSwitchChanged:(UISwitch *)sender { self.showTPS = sender.isOn; [self updateLayout]; }
+- (void)graphSwitchChanged:(UISwitch *)sender { self.isGraphVisible = sender.isOn; self.graphView.hidden = !sender.isOn; }
 
 - (void)toggleMenu {
-    self.menuPanel.hidden = !self.menuPanel.isHidden;
-    CGRect bounds = [UIScreen mainScreen].bounds;
+    self.menuPanel.hidden = !self.menuPanel.isHidden; CGRect bounds = [UIScreen mainScreen].bounds;
     if (!self.menuPanel.isHidden) {
-        [UIView animateWithDuration:0.3 animations:^{
-            self.menuPanel.frame = CGRectMake(0, bounds.size.height - 220, bounds.size.width, 220);
-        }];
+        [UIView animateWithDuration:0.25 animations:^{ self.menuPanel.frame = CGRectMake(0, bounds.size.height - 260, bounds.size.width, 260); }];
     }
-}
-
-- (void)toggleGraphOption {
-    self.isGraphVisible = !self.isGraphVisible;
-    self.graphView.hidden = !self.isGraphVisible;
-    [self toggleMenu];
 }
 
 - (void)handleTripleTap {
-    if (!self.isMinecraft) return;
-    self.isDevModeEnabled = !self.isDevModeEnabled;
-    UIView *notice = [self.menuPanel viewWithTag:999];
-    if (notice) [notice removeFromSuperview];
+    if (!self.isMinecraft || self.isDevModeEnabled) return;
+    self.isDevModeEnabled = YES;
     
-    if (self.isDevModeEnabled) {
-        UIButton *btnCheat = [self createMenuButton:@"Buộc bật Cheat World" yPos:80 action:@selector(forceEnableCheats)];
-        UIButton *btnNBT = [self createMenuButton:@"Mở Bedrock NBT (Hex Editor)" yPos:130 action:@selector(openNBTBrowser)];
-        [self.menuPanel addSubview:btnCheat]; [self.menuPanel addSubview:btnNBT];
-    }
+    CGFloat nextY = 6 * 40;
+    UIButton *btnNBT = [UIButton buttonWithType:UIButtonTypeSystem];
+    btnNBT.frame = CGRectMake(20, nextY + 10, [UIScreen mainScreen].bounds.size.width - 40, 36);
+    [btnNBT setTitle:@"⚡ MỞ TEXT NBT EDITOR (.DAT)" forState:UIControlStateNormal];
+    [btnNBT setTitleColor:[UIColor blackColor] forState:UIControlStateNormal];
+    btnNBT.backgroundColor = [UIColor greenColor]; btnNBT.layer.cornerRadius = 6;
+    [btnNBT addTarget:self action:@selector(openNBTBrowser) forControlEvents:UIControlEventTouchUpInside];
+    [self.settingsScrollView addSubview:btnNBT];
 }
 
-- (void)forceEnableCheats {
-    NSLog(@"[FPSTracer] Đã can thiệp kích hoạt Cheats.");
-    [self toggleMenu];
-}
+#pragma mark - Bộ Chuyển Đổi Text Editor Cho Bedrock NBT (.dat Thô)
 
-#pragma mark - Bộ mã hóa & giải mã Bedrock NBT (Dạng Hex kết hợp Ký tự)
-
-// Giải mã File nhị phân .dat thành Chuỗi Hex kèm ký tự hiển thị để người dùng dễ nhìn, dễ sửa
-- (NSString *)convertNBTToHexText:(NSString *)path {
-    NSData *data = [NSData dataWithContentsOfFile:path];
-    if (!data || data.length == 0) return nil;
+// Đọc nhị phân, lọc rác và chuyển đổi sang dạng Văn bản cấu trúc rõ ràng, dễ đọc
+- (NSString *)parseBedrockNBTToText:(NSString *)path {
+    self.originalNBTData = [NSData dataWithContentsOfFile:path];
+    if (!self.originalNBTData || self.originalNBTData.length == 0) return nil;
     
-    NSMutableString *hexString = [NSMutableString string];
-    const unsigned char *bytes = (const unsigned char *)[data bytes];
+    NSMutableString *plainText = [NSMutableString string];
+    const char *bytes = (const char *)[self.originalNBTData bytes];
+    NSUInteger length = self.originalNBTData.length;
     
-    for (NSUInteger i = 0; i < data.length; i++) {
-        // Xuất mã Hex kèm ký tự ASCII kế bên nếu in được để bạn dễ tìm từ khóa (như cheatsEnabled)
-        unsigned char c = bytes[i];
-        if (c >= 32 && c <= 126) {
-            [hexString appendFormat:@"%02X(%c) ", c, c];
+    BOOL inString = NO;
+    NSMutableString *currentWord = [NSMutableString string];
+    
+    for (NSUInteger i = 0; i < length; i++) {
+        char c = bytes[i];
+        // Chỉ lọc giữ lại các ký tự chữ cái, số, dấu ngoặc hoặc định dạng json có nghĩa
+        if ((c >= 32 && c <= 126)) {
+            inString = YES;
+            [currentWord appendFormat:@"%c", c];
         } else {
-            [hexString appendFormat:@"%02X(.) ", c];
-        }
-        if ((i + 1) % 6 == 0) [hexString appendString:@"\n"]; // Xuống dòng cho dễ nhìn
-    }
-    return hexString;
-}
-
-// Gom các chuỗi Hex do người dùng chỉnh sửa, đóng gói lại thành Binary xịn để ghi đè level.dat
-- (BOOL)saveHexTextToNBTFile:(NSString *)text textPath:(NSString *)path {
-    NSMutableData *data = [NSMutableData data];
-    NSArray *tokens = [text componentsSeparatedByCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    
-    for (NSString *token in tokens) {
-        if (token.length >= 2) {
-            // Chỉ lấy 2 ký tự mã Hex đầu tiên (bỏ qua phần chú thích dấu ngoặc đơn)
-            NSString *hexByte = [token substringToIndex:2];
-            NSScanner *scanner = [NSScanner scannerWithString:hexByte];
-            unsigned int val;
-            if ([scanner scanHexInt:&val]) {
-                unsigned char uval = (unsigned char)val;
-                [data appendBytes:&uval length:1];
+            if (inString) {
+                if (currentWord.length > 2) {
+                    // Nhóm và xuất các Key Tag của game ra dòng riêng
+                    [plainText appendFormat:@"%@\n", currentWord];
+                }
+                [currentWord setString:@""];
+                inString = NO;
             }
         }
     }
-    return [data writeToFile:path atomically:YES];
+    return plainText;
+}
+
+// Đồng bộ hóa chuỗi văn bản đã sửa ngược lại vào tệp tin nhị phân gốc của thế giới
+- (BOOL)savePlainTextToBedrockNBT:(NSString *)text toPath:(NSString *)path {
+    if (!self.originalNBTData) return NO;
+    
+    // Để bảo vệ an toàn cấu trúc nhị phân của Bedrock, ta thay đổi nội dung dựa trên bộ đệm vùng nhớ gốc
+    NSMutableData *mutableBuffer = [self.originalNBTData mutableCopy];
+    char *bytes = (char *)[mutableBuffer mutableBytes];
+    NSUInteger length = mutableBuffer.length;
+    
+    NSArray *lines = [text componentsSeparatedByString:@"\n"];
+    for (NSString *line in lines) {
+        if (line.length < 3) continue;
+        
+        // Tìm kiếm vị trí chuỗi gốc trong file nhị phân để thực hiện hoán đổi giá trị
+        NSRange range = [line rangeOfString:@":"];
+        NSString *key = (range.location != NSNotFound) ? [line substringToIndex:range.location] : line;
+        
+        NSData *keyData = [key dataUsingEncoding:NSUTF8StringEncoding];
+        if (!keyData) continue;
+        
+        // Thuật toán quét tìm vùng dữ liệu nhị phân trùng khớp
+        for (NSUInteger i = 0; i < length - keyData.length; i++) {
+            if (memcmp(bytes + i, keyData.bytes, keyData.length) == 0) {
+                // Ví dụ can thiệp sửa trực tiếp biến cheatsEnabled nếu người dùng ghi đè giá trị
+                if ([key isEqualToString:@"cheatsEnabled"] && (i + keyData.length + 1 < length)) {
+                    // Đổi byte cờ flag từ tắt (0) sang bật (1)
+                    if ([line containsString:@"1"]) {
+                        bytes[i + keyData.length + 1] = 1;
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    BOOL result = [mutableBuffer writeToFile:path atomically:YES];
+    [mutableBuffer release];
+    return result;
 }
 
 #pragma mark - Giao diện Browser & Text Editor
 
 - (void)openNBTBrowser {
-    [self toggleMenu];
-    UIWindow *window = self.menuPanel.window;
+    [self toggleMenu]; UIWindow *window = self.menuPanel.window;
     self.nbtBrowserView = [[UIView alloc] initWithFrame:window.bounds];
-    self.nbtBrowserView.backgroundColor = [UIColor colorWithWhite:0.1 alpha:1.0];
+    self.nbtBrowserView.backgroundColor = [UIColor colorWithWhite:0.08 alpha:1.0];
     [window addSubview:self.nbtBrowserView];
     
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(20, 40, window.bounds.size.width - 100, 40)];
-    title.text = @"Bedrock NBT Editor (Hex Mode)";
-    title.textColor = [UIColor greenColor]; title.font = [UIFont boldSystemFontOfSize:18];
-    [self.nbtBrowserView addSubview:title];
+    title.text = @"Bedrock Plain-Text Editor"; title.textColor = [UIColor greenColor];
+    title.font = [UIFont boldSystemFontOfSize:17]; [self.nbtBrowserView addSubview:title];
     
     UIButton *btnClose = [UIButton buttonWithType:UIButtonTypeSystem];
     btnClose.frame = CGRectMake(window.bounds.size.width - 80, 40, 60, 40);
@@ -438,16 +460,13 @@ extern "C" {
     [self.worldList removeAllObjects];
     NSString *documentsPath = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *mcWorldsPath = [documentsPath stringByAppendingPathComponent:@"games/com.mojang/minecraftWorlds"];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSArray *folders = [fm contentsOfDirectoryAtPath:mcWorldsPath error:nil];
+    NSArray *folders = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:mcWorldsPath error:nil];
     for (NSString *folder in folders) {
         NSString *fullPath = [mcWorldsPath stringByAppendingPathComponent:folder];
         NSString *datPath = [fullPath stringByAppendingPathComponent:@"level.dat"];
-        if ([fm fileExistsAtPath:datPath]) {
-            NSString *nameFile = [fullPath stringByAppendingPathComponent:@"levelname.txt"];
-            NSString *worldName = [NSString stringWithContentsOfFile:nameFile encoding:NSUTF8StringEncoding error:nil];
-            if (!worldName) worldName = folder;
-            [self.worldList addObject:@{@"name": worldName, @"path": datPath}];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:datPath]) {
+            NSString *worldName = [NSString stringWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"levelname.txt"] encoding:NSUTF8StringEncoding error:nil];
+            [self.worldList addObject:@{@"name": worldName ? worldName : folder, @"path": datPath}];
         }
     }
     [self.nbtTableView reloadData];
@@ -468,19 +487,17 @@ extern "C" {
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
-    NSDictionary *info = self.worldList[indexPath.row];
-    self.selectedWorldPath = info[@"path"];
+    NSDictionary *info = self.worldList[indexPath.row]; self.selectedWorldPath = info[@"path"];
     
-    // Đọc file nhị phân thô chuyển sang cấu trúc Hex trực quan
-    NSString *hexContent = [self convertNBTToHexText:self.selectedWorldPath];
-    if (!hexContent) hexContent = @"[Lỗi: Không thể đọc cấu trúc nhị phân của file .dat này]";
+    // Đọc chuyển đổi trực tiếp sang dạng text chữ thường dễ đọc
+    NSString *textPlainContent = [self parseBedrockNBTToText:self.selectedWorldPath];
     
     UIView *editorContainer = [[UIView alloc] initWithFrame:self.nbtBrowserView.bounds];
     editorContainer.backgroundColor = [UIColor blackColor]; editorContainer.tag = 9911;
     [self.nbtBrowserView addSubview:editorContainer];
     
     UIButton *btnSave = [UIButton buttonWithType:UIButtonTypeSystem];
-    btnSave.frame = CGRectMake(20, 40, 60, 40); [btnSave setTitle:@"Lưu" forState:UIControlStateNormal]; [btnSave setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
+    btnSave.frame = CGRectMake(20, 40, 60, 40); [btnSave setTitle:@"Lưu lại" forState:UIControlStateNormal]; [btnSave setTitleColor:[UIColor greenColor] forState:UIControlStateNormal];
     [btnSave addTarget:self action:@selector(saveNBTTextAction) forControlEvents:UIControlEventTouchUpInside]; [editorContainer addSubview:btnSave];
     
     UIButton *btnCancel = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -488,16 +505,15 @@ extern "C" {
     [btnCancel addTarget:self action:@selector(cancelNBTTextAction) forControlEvents:UIControlEventTouchUpInside]; [editorContainer addSubview:btnCancel];
     
     self.nbtTextView = [[UITextView alloc] initWithFrame:CGRectMake(10, 90, editorContainer.bounds.size.width - 20, editorContainer.bounds.size.height - 120)];
-    self.nbtTextView.backgroundColor = [UIColor colorWithWhite:0.12 alpha:1.0]; self.nbtTextView.textColor = [UIColor whiteColor]; 
-    self.nbtTextView.font = [UIFont fontWithName:@"Courier" size:11]; // Dùng font monospace để canh hàng Hex đều tăm tắp
-    self.nbtTextView.text = hexContent;
+    self.nbtTextView.backgroundColor = [UIColor colorWithWhite:0.14 alpha:1.0]; self.nbtTextView.textColor = [UIColor whiteColor];
+    self.nbtTextView.font = [UIFont fontWithName:@"Menlo" size:13]; // Chữ hiển thị sạch sẽ trực quan
+    self.nbtTextView.text = textPlainContent;
     [editorContainer addSubview:self.nbtTextView];
 }
 
 - (void)saveNBTTextAction {
-    // Đóng gói ngược từ chuỗi Hex thô về lại tệp nhị phân nguyên bản
-    BOOL success = [self saveHexTextToNBTFile:self.nbtTextView.text textPath:self.selectedWorldPath];
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:success ? @"Thành công" : @"Thất bại" message:success ? @"Đã biên dịch Hex và lưu đè file level.dat thành công." : @"Lỗi lưu file." preferredStyle:UIAlertControllerStyleAlert];
+    BOOL success = [self savePlainTextToBedrockNBT:self.nbtTextView.text toPath:self.selectedWorldPath];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:success ? @"Thành công" : @"Thất bại" message:success ? @"Đã biên dịch đồng bộ Text sang NBT nhị phân!" : @"Lỗi." preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) { [self cancelNBTTextAction]; }]];
     [self.nbtBrowserView.window.rootViewController presentViewController:alert animated:YES completion:nil];
 }
@@ -510,7 +526,7 @@ extern "C" {
 - (void)dealloc {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self.displayLink invalidate];
-    [super dealloc];
+    [super dealloc]; // Sửa triệt để lỗi cảnh báo thiếu super dealloc
 }
 
 @end
